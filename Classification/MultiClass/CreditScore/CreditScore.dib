@@ -1,0 +1,294 @@
+#!meta
+
+{"kernelInfo":{"defaultKernelName":"csharp","items":[{"aliases":[],"name":"csharp"}]}}
+
+#!markdown
+
+# ML.NET Example - Regression to Predict Credit Scores
+
+#!markdown
+
+This notebook uses the public domain [Credit score classification dataset](https://www.kaggle.com/datasets/parisrohan/credit-score-classification) uploaded to Kaggle by [Rohan Paris](https://www.kaggle.com/parisrohan) on September 6th, 2023.
+
+We'll use this dataset to perform a simple regression experiment with AutoML and the ML.NET DataFrame, ignoring columns that are likely to constitute PII or unfairly bias the model.
+
+#!markdown
+
+## Dependencies
+
+#!csharp
+
+#r "nuget:Microsoft.ML"
+#r "nuget:Microsoft.ML.AutoML"
+#r "nuget:Microsoft.Data.Analysis"
+
+using Microsoft.ML;
+using Microsoft.ML.AutoML;
+using Microsoft.ML.Data;
+using Microsoft.Data.Analysis;
+
+#!markdown
+
+## Data Loading
+
+While the dataset has a test and train set, it does not provide labels for the test set, so we'll stick with the training set
+
+#!csharp
+
+// Using GuessRows of 6000 here because the dataset contains a scarce number of numerical values that are formatted as "_-333333333333333333333333333_" which are not valid numerical values. 
+// Increasing the number of GuessRows helps to identify the correct data types for the columns and was done using trial and error with the given dataset.
+DataFrame dfTrain = DataFrame.LoadCsv("CreditScore.csv", guessRows: 6000);
+dfTrain.Head(3)
+
+#!csharp
+
+dfTrain["Credit_Score"].ValueCounts()
+
+#!csharp
+
+void EncodeCreditScore(DataFrame df) {
+    var creditScore = df["Credit_Score"];
+    df["Is_Good_Credit"] = df["Credit_Score"].ElementwiseEquals("Good");
+    df["Is_Standard_Credit"] = df["Credit_Score"].ElementwiseEquals("Standard");
+    df["Is_Poor_Credit"] = df["Credit_Score"].ElementwiseEquals("Poor");
+    df.Columns.Remove("Credit_Score");
+}
+EncodeCreditScore(dfTrain);
+
+#!csharp
+
+dfTrain.Info()
+
+#!markdown
+
+## Data Cleaning
+
+#!csharp
+
+dfTrain["Payment_of_Min_Amount"].ValueCounts()
+
+#!csharp
+
+dfTrain["Payment_of_Min_Amount"] = dfTrain["Payment_of_Min_Amount"].ElementwiseEquals("Yes");
+
+#!csharp
+
+void DropPIIColumns(DataFrame df) {
+    string[] columnsToDrop = new[] { 
+        "Name",
+        "SSN",
+        "ID",
+        "Credit_History_Age", // Not PII, just useless
+        "Customer_ID"};
+
+    foreach (var column in columnsToDrop) {
+        df.Columns.Remove(column);
+    }
+}
+
+DropPIIColumns(dfTrain);
+
+#!csharp
+
+dfTrain.Info().Display();
+dfTrain.Description()
+
+#!markdown
+
+Looks like we have nulls in Monthly_Inhand_Salary and Num_Credit_Inquiries. We can *probably* use 0 for inquiries, but inhand salary might be best if we used median, or calculated using a relationship between other columns such as the annual income. However, Annual Income, Credit Limit, Delayed Payment, CreditHistory, Amount_invested_monthly, and Monthly_Balance are all strings when they should be numeric.
+
+#!csharp
+
+float? ParseQuestionableNumber(string? value) {
+    if (value == null) return null;
+
+    value = value.Replace("_", "");
+
+    if (!float.TryParse(value, out float result)) return null;
+
+    return result;
+}
+
+#!csharp
+
+void ParseStringlyTypedNumberColumns(DataFrame df) {
+    string[] columnsToParse = new[] {
+        "Age",
+        "Annual_Income",
+        "Monthly_Inhand_Salary",
+        "Num_Bank_Accounts",
+        "Num_Credit_Card",
+        "Interest_Rate",
+        "Num_of_Loan",
+        "Delay_from_due_date",
+        "Num_of_Delayed_Payment",
+        "Changed_Credit_Limit",
+        "Num_Credit_Inquiries",
+        "Outstanding_Debt",
+        "Credit_Utilization_Ratio",
+        "Total_EMI_per_month",
+        "Amount_invested_monthly",
+        "Monthly_Balance"
+    };
+
+    var columns = df.Columns.Where(column => columnsToParse.Contains(column.Name)).ToList();
+
+    foreach (var column in columns) {
+        try {
+            df[column.Name] = new PrimitiveDataFrameColumn<float>(column.Name, df[column.Name].Cast<object>().Select(value => ParseQuestionableNumber(value?.ToString())));
+        }
+        catch (Exception e) {
+            Console.WriteLine($"Failed to parse column {column.Name} ({column.GetType()}): {e.Message}");
+        }
+    }
+}
+
+#!csharp
+
+ParseStringlyTypedNumberColumns(dfTrain);
+dfTrain.Info().Display();
+dfTrain.Description()
+
+#!markdown
+
+Okay. We definitely have nulls for inhand salary, delayed payment count, changed credit limit, and number of credit inquiries along with invested monthly and monthly balance.
+
+Before making decisions, we should see some correlations. This is best done in F# so let's save to a temp file to make it easier to load in F#.
+
+#!csharp
+
+DataFrame.SaveCsv(dfTrain, "ready_for_corr.csv");
+
+#!markdown
+
+## Correlation Analysis
+
+#!fsharp
+
+#r "nuget:Microsoft.Data.Analysis,0.21.1"
+#r "nuget:Plotly.NET,5.0.0"
+#r "nuget:Plotly.NET.Interactive,5.0.0"
+#r "nuget:MathNet.Numerics,5.0.0"
+
+open MathNet.Numerics.Statistics
+open Plotly.NET
+open Microsoft.Data.Analysis
+
+#!fsharp
+
+let dfRaw = DataFrame.LoadCsv("ready_for_corr.csv")
+let df = dfRaw.DropNulls()
+df.Info().Display()
+df.Description()
+
+#!fsharp
+
+df["Is_Good_Credit"].GetType()
+
+#!fsharp
+
+// This code shamelessly stolen from Chapter 6 of my own book, "Data Science in .NET with Polyglot Notebooks"
+let IdentifyColumnsToAnalyze (df: DataFrame) =
+    df.Columns 
+    |> Seq.filter (fun col ->
+            let t = col.GetType()
+            t = typeof<SingleDataFrameColumn> || t = typeof<PrimitiveDataFrameColumn<bool>> || t = typeof<BooleanDataFrameColumn>
+        )
+    |> Seq.map (fun col -> col.Name)
+    |> Array.ofSeq
+
+let getSingleFromBool (input: Nullable<bool>): single =
+    match input.HasValue with
+        | false -> 0f
+        | true -> 
+            match input.Value with
+            | true -> 1.0f
+            | false -> 0.0f
+
+let getColumnValue( df: DataFrame, colName: string) : float seq =
+    match df.Columns.[colName] with
+    | :? SingleDataFrameColumn as singleCol ->
+        singleCol 
+        |> Seq.cast<single> 
+        |> Seq.map float
+    | :? BooleanDataFrameColumn as boolCol ->
+        boolCol
+        |> Seq.map getSingleFromBool
+        |> Seq.map float
+    | :? PrimitiveDataFrameColumn<bool> as boolCol ->
+        boolCol
+        |> Seq.map getSingleFromBool
+        |> Seq.map float
+    | _ -> // Expand to support additional types as needed
+        Seq.empty<float>
+
+let buildCorrelationMatrix (df: DataFrame) =
+    // Figure out what columns we're analyzing
+    let columnsToAnalyze = df |> IdentifyColumnsToAnalyze
+    let numColumns = Array.length columnsToAnalyze
+    
+    // Build a jagged array containing the correlation results
+    let results : float[][] = Array.zeroCreate numColumns
+    for y = 0 to numColumns - 1 do
+        let colY = getColumnValue(df, columnsToAnalyze[y])
+        let rowResults : float[] = Array.create numColumns nan
+        results.[y] <- rowResults
+
+        for x = 0 to y do
+            let colX = getColumnValue(df, columnsToAnalyze[x])
+            rowResults.[x] <- Correlation.Pearson(colX, colY)
+    
+    // Return a tuple with the results and the columns analyzed
+    results, columnsToAnalyze
+
+let plotCorrelationMatrix (correlationMatrix, correlationColumns) =
+    Chart.Heatmap(zData=correlationMatrix, 
+                ReverseYAxis=true,
+                X=correlationColumns,
+                Y=correlationColumns)
+        |> Chart.withTitle "Correlation Matrix"
+
+#!fsharp
+
+df 
+|> buildCorrelationMatrix 
+|> plotCorrelationMatrix
+|> Chart.withTitle "Feature Correlations for Credit Score Prediction"
+|> Chart.withSize (1200, 800)
+
+#!markdown
+
+## Handling Missing Values
+
+#!markdown
+
+Now let's consider these correlations when deciding what to do with our nulls:
+
+- **Monthly_Inhand_Salary** appears weakly correlated, so we could go with the median or mean value
+- **Num_of_Delayed_Payments** has a positive correlation with outstanding debt and changed credit limit as well as poor credit. We could use a mean or median for poor credit or multiply outstanding debt by a correlation factor, or we could remove the column or those rows.
+- **Changed_Credit_Limit** is moderately associated with outstanding debt and delay from due date. Those could factor in. Or we could remove all nulls.
+- **Num_Credit_Inquiries** appears to not be correlated with much, and so our median or mean should be fine if we wanted to use it.
+- **Amount_Invested_Monthly** is another low correlation column that would be fine to handle with mean or median.
+
+Based on these decisions, the low correlation columns of inhand salary, # credit inquiries, and amount invested monthly will be replaced with median values. After this occurs, any row with remaining null values will be dropped.
+
+#!csharp
+
+dfTrain.Info()
+
+#!csharp
+
+dfTrain["Monthly_Inhand_Salary"] = dfTrain["Monthly_Inhand_Salary"].FillNulls(dfTrain["Monthly_Inhand_Salary"].Median());
+dfTrain["Num_Credit_Inquiries"] = dfTrain["Num_Credit_Inquiries"].FillNulls(dfTrain["Num_Credit_Inquiries"].Median());
+dfTrain["Amount_invested_monthly"] = dfTrain["Amount_invested_monthly"].FillNulls(dfTrain["Amount_invested_monthly"].Median());
+
+dfTrain.Description()
+
+#!csharp
+
+dfTrain = dfTrain.DropNulls();
+dfTrain.Description()
+
+#!markdown
+
+## Model Training
